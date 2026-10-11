@@ -33,7 +33,7 @@ async def predict_severity(file: UploadFile = File(...)):
     if session is None:
         raise HTTPException(status_code=503, detail="AI Model session is not initialized.")
 
-    # Read uploaded file byte
+    # Read uploaded file bytes
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
