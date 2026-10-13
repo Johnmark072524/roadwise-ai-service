@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import logging
 import os
 from typing import Optional
@@ -13,11 +14,11 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("roadwise")
 
-app = FastAPI(title="RoadWise AI Service", version="1.1.0")
+app = FastAPI(title="RoadWise AI Service", version="1.2.0")
 
 
 # --------------------------------------------------------------------------- #
-# Configuration (override via environment variables)
+# Configuration
 # --------------------------------------------------------------------------- #
 def _env_float(name: str, default: Optional[float]) -> Optional[float]:
     raw = os.getenv(name)
@@ -32,30 +33,33 @@ def _env_float(name: str, default: Optional[float]) -> Optional[float]:
 
 MODEL_PATH = os.getenv("MODEL_PATH", "rdd2022_d4_resnet38.onnx")
 DEFAULT_INPUT_SIZE = int(os.getenv("INPUT_SIZE", "224"))
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))  # 12 MB
-Image.MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(60_000_000)))  # decompression-bomb guard
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+Image.MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(60_000_000)))
 
-# Must match how the model was trained. Your original code used plain /255,
-# so that is the default. Set USE_IMAGENET_NORM=1 if training used ImageNet mean/std.
+# Severity model preprocessing (must match its training). Plain /255 by default.
 USE_IMAGENET_NORM = os.getenv("USE_IMAGENET_NORM", "0") == "1"
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
-LETTERBOX_FILL = int(os.getenv("LETTERBOX_FILL", "114"))  # neutral grey padding
+LETTERBOX_FILL = int(os.getenv("LETTERBOX_FILL", "114"))
 
-# Output-distribution gates. An image is "weak/ambiguous" if ANY of these trip.
-CONF_FLOOR = _env_float("CONF_FLOOR", 0.55)        # top-1 probability must be >= this
-MARGIN_MIN = _env_float("MARGIN_MIN", 0.15)        # top-1 minus top-2 must be >= this
-ENTROPY_MAX = _env_float("ENTROPY_MAX", 0.85)      # normalized entropy (0..1) must be <= this
-MAX_LOGIT_FLOOR = _env_float("MAX_LOGIT_FLOOR", None)  # optional; disabled unless set (see notes)
+# Gate
+GATE_EMBEDDER_PATH = os.getenv("GATE_EMBEDDER_PATH", "gate_embedder.onnx")
+GATE_HEAD_PATH = os.getenv("GATE_HEAD_PATH", "gate_head.json")
+GATE_MIN_PROB = _env_float("GATE_MIN_PROB", 0.50)  # winning gate class must reach this, else "unsure"
+# Below this severity-group probability the message asks for human verification (severity still returned).
+SEVERITY_VERIFY_BELOW = _env_float("SEVERITY_VERIFY_BELOW", 0.50)
 
-# Texture gate (gradient statistics on a 0..1 grayscale image)
-TEXTURE_MEAN_MIN = _env_float("TEXTURE_MEAN_MIN", 0.012)      # mean gradient magnitude
-TEXTURE_STRONG_MIN = _env_float("TEXTURE_STRONG_MIN", 0.010)  # fraction of strong-edge pixels
+# Fallback gates (only used when the gate files are absent)
+CONF_FLOOR = _env_float("CONF_FLOOR", 0.55)
+MARGIN_MIN = _env_float("MARGIN_MIN", 0.15)
+ENTROPY_MAX = _env_float("ENTROPY_MAX", 0.85)
+MAX_LOGIT_FLOOR = _env_float("MAX_LOGIT_FLOOR", None)
+ENERGY_FLOOR = _env_float("ENERGY_FLOOR", None)
+TEXTURE_MEAN_MIN = _env_float("TEXTURE_MEAN_MIN", 0.012)
+TEXTURE_STRONG_MIN = _env_float("TEXTURE_STRONG_MIN", 0.010)
 STRONG_EDGE_LEVEL = _env_float("STRONG_EDGE_LEVEL", 0.12)
-# If the surface is flat, the model must be *very* sure to still be believed.
 FLAT_OVERRIDE_CONF = _env_float("FLAT_OVERRIDE_CONF", 0.90)
 
-# Run at most N inferences at once (shared CPU on Render).
 MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "1"))
 _inference_gate: Optional[asyncio.Semaphore] = None
 
@@ -63,68 +67,118 @@ _inference_gate: Optional[asyncio.Semaphore] = None
 # --------------------------------------------------------------------------- #
 # Class / severity mapping
 # --------------------------------------------------------------------------- #
-# 4-class RDD2022 D4 convention
 RDD_D4_CLASSES = [
     ("D00", "Longitudinal Crack", "Low"),
     ("D10", "Transverse Crack", "Low"),
     ("D20", "Alligator Crack", "Medium"),
     ("D40", "Pothole", "High"),
 ]
-SEVERITY_3_CLASS = ["Low", "Medium", "High"]
+SEVERITY_ORDER = ["Low", "Medium", "High"]
 
 
-def map_class(idx: int, num_classes: int):
+def class_table(num_classes: int):
+    """[(label, severity)] per output index, or None if the size is unknown."""
+    if num_classes == 4:
+        return [(f"{n} ({c})", s) for c, n, s in RDD_D4_CLASSES]
+    if num_classes == 3:
+        return [(f"Pavement distress ({s} severity class)", s) for s in SEVERITY_ORDER]
+    return None
+
+
+def severity_from_probs(probs: np.ndarray):
     """
-    Returns (severity, detected_damage_type) or (None, None) if the output size
-    is not one we know how to interpret. Never raises IndexError.
+    Sum probabilities per severity level, pick the heaviest level, and report the most likely
+    damage type inside that level. Returns (severity, damage_type, severity_prob) or None.
     """
-    if num_classes == 4 and 0 <= idx < len(RDD_D4_CLASSES):
-        code, name, severity = RDD_D4_CLASSES[idx]
-        return severity, f"{name} ({code})"
-    if num_classes == 3 and 0 <= idx < len(SEVERITY_3_CLASS):
-        severity = SEVERITY_3_CLASS[idx]
-        return severity, f"Pavement distress ({severity} severity class)"
-    return None, None
+    table = class_table(len(probs))
+    if table is None:
+        return None
+    mass = {s: 0.0 for s in SEVERITY_ORDER}
+    for p, (_, s) in zip(probs, table):
+        mass[s] += float(p)
+    severity = max(SEVERITY_ORDER, key=lambda s: mass[s])
+    idxs = [i for i, (_, s) in enumerate(table) if s == severity]
+    best = max(idxs, key=lambda i: probs[i])
+    return severity, table[best][0], mass[severity]
 
 
 # --------------------------------------------------------------------------- #
 # Model loading
 # --------------------------------------------------------------------------- #
+def _session_options():
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return opts
+
+
 session: Optional[ort.InferenceSession] = None
 input_name: Optional[str] = None
 input_h = input_w = DEFAULT_INPUT_SIZE
+
+gate_session: Optional[ort.InferenceSession] = None
+gate_input_name: Optional[str] = None
+gate_h = gate_w = 224
+gate_head: Optional[dict] = None
+
+
+def _static_hw(shape, default):
+    if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
+        return shape[2], shape[3]
+    return default, default
 
 
 def _load_model():
     global session, input_name, input_h, input_w
     try:
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
-        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-        session = ort.InferenceSession(
-            MODEL_PATH, sess_options=opts, providers=["CPUExecutionProvider"]
-        )
+        session = ort.InferenceSession(MODEL_PATH, sess_options=_session_options(),
+                                       providers=["CPUExecutionProvider"])
         inp = session.get_inputs()[0]
         input_name = inp.name
-
-        # Respect static input dims if the model declares them (NCHW).
-        shape = inp.shape
-        if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
-            input_h, input_w = shape[2], shape[3]
-        log.info(">>> [AI READY] Model '%s' loaded (input %s, %dx%d).", MODEL_PATH, shape, input_h, input_w)
-
-        # Warm-up so the first real request isn't slow.
-        dummy = np.zeros((1, 3, input_h, input_w), dtype=np.float32)
-        session.run(None, {input_name: dummy})
+        input_h, input_w = _static_hw(inp.shape, DEFAULT_INPUT_SIZE)
+        log.info(">>> [AI READY] Severity model '%s' loaded (%dx%d).", MODEL_PATH, input_h, input_w)
+        session.run(None, {input_name: np.zeros((1, 3, input_h, input_w), dtype=np.float32)})
     except Exception as e:  # noqa: BLE001
         log.error(">>> [AI ERROR] Failed to load model: %s", e)
         session = None
 
 
+def _load_gate():
+    global gate_session, gate_input_name, gate_h, gate_w, gate_head
+    if not (os.path.exists(GATE_EMBEDDER_PATH) and os.path.exists(GATE_HEAD_PATH)):
+        log.info(">>> [GATE] files not found (%s, %s): using fallback gates.", GATE_EMBEDDER_PATH, GATE_HEAD_PATH)
+        return
+    try:
+        with open(GATE_HEAD_PATH, "r", encoding="utf-8") as f:
+            head = json.load(f)
+        head["mean"] = np.asarray(head["mean"], dtype=np.float64)
+        head["scale"] = np.asarray(head["scale"], dtype=np.float64)
+        head["coef"] = np.asarray(head["coef"], dtype=np.float64)
+        head["intercept"] = np.asarray(head["intercept"], dtype=np.float64)
+        if head["coef"].shape[0] != len(head["classes"]):
+            raise ValueError("coef rows do not match classes")
+
+        gs = ort.InferenceSession(GATE_EMBEDDER_PATH, sess_options=_session_options(),
+                                  providers=["CPUExecutionProvider"])
+        inp = gs.get_inputs()[0]
+        gh, gw = _static_hw(inp.shape, int(head.get("input_size", 224)))
+        out = gs.run(None, {inp.name: np.zeros((1, 3, gh, gw), dtype=np.float32)})[0]
+        dim = int(np.asarray(out).reshape(-1).shape[0])
+        if dim != head["mean"].shape[0] or dim != head["coef"].shape[1]:
+            raise ValueError(f"embedding size {dim} does not match head ({head['coef'].shape[1]})")
+
+        gate_session, gate_input_name, gate_h, gate_w, gate_head = gs, inp.name, gh, gw, head
+        log.info(">>> [GATE READY] classes=%s embedding=%d input=%dx%d", head["classes"], dim, gh, gw)
+    except Exception as e:  # noqa: BLE001
+        log.error(">>> [GATE ERROR] %s (falling back to older gates)", e)
+        gate_session = None
+        gate_head = None
+
+
 _load_model()
+_load_gate()
 
 
 @app.on_event("startup")
@@ -137,37 +191,34 @@ async def _startup():
 # Preprocessing
 # --------------------------------------------------------------------------- #
 def letterbox(image: Image.Image, target_h: int, target_w: int):
-    """
-    Scale to fit inside (target_h, target_w) without distortion, centre on a grey canvas.
-    Returns (canvas_image, content_image) where content_image is the un-padded resized photo.
-    """
+    """Fit inside target without distortion on a grey canvas. Returns (canvas, content)."""
     w, h = image.size
     scale = min(target_w / w, target_h / h)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
     content = image.resize((new_w, new_h), Image.BILINEAR)
-
     canvas = Image.new("RGB", (target_w, target_h), (LETTERBOX_FILL,) * 3)
     canvas.paste(content, ((target_w - new_w) // 2, (target_h - new_h) // 2))
     return canvas, content
 
 
-def to_tensor(canvas: Image.Image) -> np.ndarray:
-    arr = np.asarray(canvas, dtype=np.float32) / 255.0   # HWC, [0,1]
-    arr = np.transpose(arr, (2, 0, 1))                   # CHW
-    if USE_IMAGENET_NORM:
+def to_tensor(canvas: Image.Image, imagenet_norm: Optional[bool] = None) -> np.ndarray:
+    if imagenet_norm is None:
+        imagenet_norm = USE_IMAGENET_NORM
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    if imagenet_norm:
         arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-    return np.ascontiguousarray(arr[np.newaxis, ...], dtype=np.float32)  # NCHW
+    return np.ascontiguousarray(arr[np.newaxis, ...], dtype=np.float32)
 
 
 def load_image(contents: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(contents))
     try:
-        # Fast JPEG downscale-on-decode: big phone photos decode much cheaper.
-        img.draft("RGB", (input_w * 2, input_h * 2))
+        img.draft("RGB", (max(input_w, gate_w) * 2, max(input_h, gate_h) * 2))
     except Exception:  # noqa: BLE001
         pass
-    img = ImageOps.exif_transpose(img)  # honour phone orientation tag
+    img = ImageOps.exif_transpose(img)
     return img.convert("RGB")
 
 
@@ -180,6 +231,11 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     return e / np.sum(e)
 
 
+def energy_score(logits: np.ndarray) -> float:
+    m = float(np.max(logits))
+    return m + float(np.log(np.sum(np.exp(logits - m))))
+
+
 def looks_like_probabilities(v: np.ndarray) -> bool:
     return bool(np.all(v >= 0.0) and np.all(v <= 1.0) and abs(float(v.sum()) - 1.0) < 1e-3)
 
@@ -190,22 +246,16 @@ def distribution_stats(probs: np.ndarray) -> dict:
     top2 = float(probs[order[1]]) if len(order) > 1 else 0.0
     n = len(probs)
     entropy = float(-np.sum(probs * np.log(probs + 1e-12)))
-    entropy_norm = entropy / float(np.log(n)) if n > 1 else 0.0
     return {
         "top_idx": int(order[0]),
         "top1": top1,
         "top2": top2,
         "margin": top1 - top2,
-        "entropy_norm": entropy_norm,
+        "entropy_norm": entropy / float(np.log(n)) if n > 1 else 0.0,
     }
 
 
 def texture_stats(content: Image.Image) -> dict:
-    """
-    Pure NumPy surface-activity check on the un-padded photo.
-    Smooth/uniform scenes have almost no gradient energy; cracked or broken
-    pavement has thin, strong edges. This is a *supporting* signal only.
-    """
     gray = np.asarray(content.convert("L"), dtype=np.float32) / 255.0
     if gray.shape[0] < 3 or gray.shape[1] < 3:
         return {"mean_gradient": 0.0, "strong_edge_ratio": 0.0, "flat": True}
@@ -218,6 +268,27 @@ def texture_stats(content: Image.Image) -> dict:
     return {"mean_gradient": mean_grad, "strong_edge_ratio": strong_ratio, "flat": flat}
 
 
+def gate_predict(image: Image.Image) -> dict:
+    """Run the embedder + trained head. Returns {class_name: probability}."""
+    canvas, _ = letterbox(image, gate_h, gate_w)
+    emb = gate_session.run(None, {gate_input_name: to_tensor(canvas, imagenet_norm=True)})[0]
+    emb = np.asarray(emb, dtype=np.float64).reshape(-1)
+    z = (emb - gate_head["mean"]) / np.where(gate_head["scale"] == 0, 1.0, gate_head["scale"])
+    logits = gate_head["coef"] @ z + gate_head["intercept"]
+    probs = softmax(logits)
+    return {c: float(p) for c, p in zip(gate_head["classes"], probs)}
+
+
+def run_severity_model(image: Image.Image):
+    canvas, content = letterbox(image, input_h, input_w)
+    outputs = session.run(None, {input_name: to_tensor(canvas)})
+    raw = np.asarray(outputs[0], dtype=np.float32).reshape(-1)
+    is_prob = looks_like_probabilities(raw)
+    probs = raw.astype(np.float64) if is_prob else softmax(raw.astype(np.float64))
+    energy = None if is_prob else energy_score(raw.astype(np.float64))
+    return raw, probs, energy, content
+
+
 def build_response(severity, confidence, status, damage_type, message):
     return {
         "severity": severity,
@@ -228,33 +299,59 @@ def build_response(severity, confidence, status, damage_type, message):
     }
 
 
-def analyze(contents: bytes, debug: bool = False) -> dict:
-    # ---- decode + preprocess ----
-    try:
-        image = load_image(contents)
-    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid or unsupported image: {e}")
+# --------------------------------------------------------------------------- #
+# Decision logic
+# --------------------------------------------------------------------------- #
+def _analyze_with_gate(image: Image.Image, debug: bool) -> dict:
+    gate = gate_predict(image)
+    top_class = max(gate, key=gate.get)
+    top_p = gate[top_class]
+    diag = {"mode": "gate", "gate": {k: round(v, 4) for k, v in gate.items()}}
 
-    canvas, content = letterbox(image, input_h, input_w)
-    tensor = to_tensor(canvas)
-
-    # ---- inference ----
-    outputs = session.run(None, {input_name: tensor})
-    raw = np.asarray(outputs[0], dtype=np.float32).reshape(-1)  # (1,N) or (N,) -> (N,)
-    num_classes = int(raw.shape[0])
-
-    if num_classes < 2:
-        return build_response(
+    if top_p < GATE_MIN_PROB:
+        result = build_response(
             "Unassessed", 0.0, "LOW_CONFIDENCE", None,
-            f"Model returned {num_classes} output(s); cannot interpret result."
-        )
+            "The AI could not tell whether this photo shows road damage. "
+            "Please retake the photo or review manually.")
+    elif top_class == "nonroad":
+        result = build_response(
+            "Unassessed", round(top_p * 100.0, 1), "LOW_CONFIDENCE", None,
+            "This photo does not appear to show a road surface. Please upload a photo of the road.")
+    elif top_class == "undamaged":
+        result = build_response(
+            "Undamaged", round(top_p * 100.0, 1), "UNDAMAGED", None,
+            "No significant pavement distress detected.")
+    else:  # damaged
+        raw, probs, energy, _content = run_severity_model(image)
+        sev = severity_from_probs(probs)
+        diag.update({"num_classes": int(raw.shape[0]),
+                     "probs": [round(float(p), 4) for p in probs]})
+        if sev is None:
+            result = build_response(
+                "Unassessed", 0.0, "LOW_CONFIDENCE", None,
+                f"Damage detected, but the severity model returned {raw.shape[0]} classes, "
+                "which has no configured severity mapping.")
+        else:
+            severity, damage_type, sev_p = sev
+            msg = f"{damage_type} detected; assessed severity: {severity}."
+            if sev_p < SEVERITY_VERIFY_BELOW:
+                msg += " The AI is less certain about the exact damage type; please verify the severity."
+            result = build_response(severity, round(sev_p * 100.0, 1), "CONFIRMED", damage_type, msg)
+    if debug:
+        result["diagnostics"] = diag
+    log.info("predict(gate) -> %s | %s", result["status"], diag)
+    return result
 
-    probs = raw.astype(np.float64) if looks_like_probabilities(raw) else softmax(raw.astype(np.float64))
+
+def _analyze_fallback(image: Image.Image, debug: bool) -> dict:
+    raw, probs, energy, content = run_severity_model(image)
+    num_classes = int(raw.shape[0])
+    if num_classes < 2:
+        return build_response("Unassessed", 0.0, "LOW_CONFIDENCE", None,
+                              f"Model returned {num_classes} output(s); cannot interpret result.")
+
     stats = distribution_stats(probs)
     tex = texture_stats(content)
-    max_logit = float(raw.max())
-
-    # ---- ambiguity gates (OOD / undamaged road) ----
     reasons = []
     if stats["top1"] < CONF_FLOOR:
         reasons.append(f"top confidence {stats['top1']*100:.1f}% below floor {CONF_FLOOR*100:.0f}%")
@@ -262,59 +359,54 @@ def analyze(contents: bytes, debug: bool = False) -> dict:
         reasons.append(f"top-2 margin {stats['margin']*100:.1f}% too narrow")
     if stats["entropy_norm"] > ENTROPY_MAX:
         reasons.append(f"prediction entropy {stats['entropy_norm']:.2f} too high")
-    if MAX_LOGIT_FLOOR is not None and max_logit < MAX_LOGIT_FLOOR:
-        reasons.append(f"max logit {max_logit:.2f} below floor {MAX_LOGIT_FLOOR}")
+    if MAX_LOGIT_FLOOR is not None and float(raw.max()) < MAX_LOGIT_FLOOR:
+        reasons.append("max logit below floor")
+    if ENERGY_FLOOR is not None and energy is not None and energy < ENERGY_FLOOR:
+        reasons.append(f"energy {energy:.2f} below floor {ENERGY_FLOOR}")
     weak = bool(reasons)
-
     flat_but_unsure = tex["flat"] and stats["top1"] < FLAT_OVERRIDE_CONF
-    if tex["flat"] and not weak and flat_but_unsure:
-        reasons.append("surface texture is smooth/uniform")
 
-    diagnostics = {
-        "num_classes": num_classes,
-        "top1": round(stats["top1"], 4),
-        "top2": round(stats["top2"], 4),
-        "margin": round(stats["margin"], 4),
+    diag = {
+        "mode": "fallback", "num_classes": num_classes,
+        "top1": round(stats["top1"], 4), "margin": round(stats["margin"], 4),
         "entropy_norm": round(stats["entropy_norm"], 4),
-        "max_logit": round(max_logit, 3),
+        "max_logit": round(float(raw.max()), 3),
+        "energy": None if energy is None else round(energy, 3),
         "texture": {k: (round(v, 5) if isinstance(v, float) else v) for k, v in tex.items()},
         "reasons": reasons,
     }
 
-    severity, damage_type = map_class(stats["top_idx"], num_classes)
-
-    # ---- decision ----
+    sev = severity_from_probs(probs)
     if weak or flat_but_unsure:
         if tex["flat"]:
-            result = build_response(
-                "Undamaged", 0.0, "UNDAMAGED", None,
-                "No significant pavement distress detected. Surface appears smooth and the model "
-                "found no clear damage pattern."
-            )
+            result = build_response("Undamaged", 0.0, "UNDAMAGED", None,
+                                    "No significant pavement distress detected.")
         else:
-            result = build_response(
-                "Unassessed", 0.0, "LOW_CONFIDENCE", None,
-                "The AI could not make a reliable assessment (image may not show a road surface, "
-                "or the damage is unclear). Please retake the photo or review manually."
-            )
-    elif severity is None:
-        result = build_response(
-            "Unassessed", 0.0, "LOW_CONFIDENCE", None,
-            f"Model produced {num_classes} classes, which has no configured severity mapping."
-        )
+            result = build_response("Unassessed", 0.0, "LOW_CONFIDENCE", None,
+                                    "The AI could not make a reliable assessment. "
+                                    "Please retake the photo or review manually.")
+    elif sev is None:
+        result = build_response("Unassessed", 0.0, "LOW_CONFIDENCE", None,
+                                f"Model produced {num_classes} classes, which has no configured severity mapping.")
     else:
-        result = build_response(
-            severity,
-            round(stats["top1"] * 100.0, 1),
-            "CONFIRMED",
-            damage_type,
-            f"{damage_type} detected; assessed severity: {severity}.",
-        )
-
+        severity, damage_type, sev_p = sev
+        result = build_response(severity, round(sev_p * 100.0, 1), "CONFIRMED", damage_type,
+                                f"{damage_type} detected; assessed severity: {severity}.")
     if debug:
-        result["diagnostics"] = diagnostics
-    log.info("predict -> %s | %s", result["status"], diagnostics)
+        result["diagnostics"] = diag
+    log.info("predict(fallback) -> %s | %s", result["status"], diag)
     return result
+
+
+def analyze(contents: bytes, debug: bool = False) -> dict:
+    try:
+        image = load_image(contents)
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid or unsupported image: {e}")
+
+    if gate_session is not None and gate_head is not None:
+        return _analyze_with_gate(image, debug)
+    return _analyze_fallback(image, debug)
 
 
 # --------------------------------------------------------------------------- #
@@ -322,11 +414,11 @@ def analyze(contents: bytes, debug: bool = False) -> dict:
 # --------------------------------------------------------------------------- #
 @app.get("/")
 def health_check():
-    """Health check endpoint to verify the service is awake."""
     return {
         "status": "online",
         "service": "RoadWise AI Inference",
         "model_loaded": session is not None,
+        "gate_loaded": gate_session is not None,
     }
 
 
@@ -343,10 +435,8 @@ async def predict_severity(
     if not contents:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Image exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
-        )
+        raise HTTPException(status_code=413,
+                            detail=f"Image exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.")
 
     try:
         gate = _inference_gate or asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
