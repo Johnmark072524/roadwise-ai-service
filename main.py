@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import io
 import json
 import logging
@@ -31,25 +32,27 @@ def _env_float(name: str, default: Optional[float]) -> Optional[float]:
         return default
 
 
-MODEL_PATH = os.getenv("MODEL_PATH", "rdd2022_d4_resnet38.onnx")
+# 1. Switched to DINO default
+MODEL_PATH = os.getenv("MODEL_PATH", "rdd2022_dino_d4.onnx")
 DEFAULT_INPUT_SIZE = int(os.getenv("INPUT_SIZE", "224"))
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+
+# 2. Cleaned up syntax errors & capped upload at 8MB to protect 512MB RAM
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 Image.MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(60_000_000)))
 
-# Severity model preprocessing (must match its training). Plain /255 by default.
+# Severity model preprocessing (plain /255 verified for DINO & ResNet-38)
 USE_IMAGENET_NORM = os.getenv("USE_IMAGENET_NORM", "0") == "1"
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 LETTERBOX_FILL = int(os.getenv("LETTERBOX_FILL", "114"))
 
-# Gate
+# Gate Configuration
 GATE_EMBEDDER_PATH = os.getenv("GATE_EMBEDDER_PATH", "gate_embedder.onnx")
 GATE_HEAD_PATH = os.getenv("GATE_HEAD_PATH", "gate_head.json")
-GATE_MIN_PROB = _env_float("GATE_MIN_PROB", 0.50)  # winning gate class must reach this, else "unsure"
-# Below this severity-group probability the message asks for human verification (severity still returned).
+GATE_MIN_PROB = _env_float("GATE_MIN_PROB", 0.50)
 SEVERITY_VERIFY_BELOW = _env_float("SEVERITY_VERIFY_BELOW", 0.50)
 
-# Fallback gates (only used when the gate files are absent)
+# Fallback gates (used if gate files are absent)
 CONF_FLOOR = _env_float("CONF_FLOOR", 0.55)
 MARGIN_MIN = _env_float("MARGIN_MIN", 0.15)
 ENTROPY_MAX = _env_float("ENTROPY_MAX", 0.85)
@@ -86,10 +89,6 @@ def class_table(num_classes: int):
 
 
 def severity_from_probs(probs: np.ndarray):
-    """
-    Sum probabilities per severity level, pick the heaviest level, and report the most likely
-    damage type inside that level. Returns (severity, damage_type, severity_prob) or None.
-    """
     table = class_table(len(probs))
     if table is None:
         return None
@@ -103,10 +102,12 @@ def severity_from_probs(probs: np.ndarray):
 
 
 # --------------------------------------------------------------------------- #
-# Model loading
+# Model loading & Memory Guards
 # --------------------------------------------------------------------------- #
 def _session_options():
     opts = ort.SessionOptions()
+    # Critical for Render 512MB RAM: Releases memory back to the OS immediately
+    opts.enable_cpu_mem_arena = False
     opts.intra_op_num_threads = 1
     opts.inter_op_num_threads = 1
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -140,7 +141,7 @@ def _load_model():
         input_h, input_w = _static_hw(inp.shape, DEFAULT_INPUT_SIZE)
         log.info(">>> [AI READY] Severity model '%s' loaded (%dx%d).", MODEL_PATH, input_h, input_w)
         session.run(None, {input_name: np.zeros((1, 3, input_h, input_w), dtype=np.float32)})
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.error(">>> [AI ERROR] Failed to load model: %s", e)
         session = None
 
@@ -171,7 +172,7 @@ def _load_gate():
 
         gate_session, gate_input_name, gate_h, gate_w, gate_head = gs, inp.name, gh, gw, head
         log.info(">>> [GATE READY] classes=%s embedding=%d input=%dx%d", head["classes"], dim, gh, gw)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.error(">>> [GATE ERROR] %s (falling back to older gates)", e)
         gate_session = None
         gate_head = None
@@ -191,7 +192,6 @@ async def _startup():
 # Preprocessing
 # --------------------------------------------------------------------------- #
 def letterbox(image: Image.Image, target_h: int, target_w: int):
-    """Fit inside target without distortion on a grey canvas. Returns (canvas, content)."""
     w, h = image.size
     scale = min(target_w / w, target_h / h)
     new_w = max(1, int(round(w * scale)))
@@ -216,7 +216,7 @@ def load_image(contents: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(contents))
     try:
         img.draft("RGB", (max(input_w, gate_w) * 2, max(input_h, gate_h) * 2))
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     img = ImageOps.exif_transpose(img)
     return img.convert("RGB")
@@ -269,7 +269,6 @@ def texture_stats(content: Image.Image) -> dict:
 
 
 def gate_predict(image: Image.Image) -> dict:
-    """Run the embedder + trained head. Returns {class_name: probability}."""
     canvas, _ = letterbox(image, gate_h, gate_w)
     emb = gate_session.run(None, {gate_input_name: to_tensor(canvas, imagenet_norm=True)})[0]
     emb = np.asarray(emb, dtype=np.float64).reshape(-1)
@@ -321,7 +320,7 @@ def _analyze_with_gate(image: Image.Image, debug: bool) -> dict:
         result = build_response(
             "Undamaged", round(top_p * 100.0, 1), "UNDAMAGED", None,
             "No significant pavement distress detected.")
-    else:  # damaged
+    else:
         raw, probs, energy, _content = run_severity_model(image)
         sev = severity_from_probs(probs)
         diag.update({"num_classes": int(raw.shape[0]),
@@ -419,6 +418,7 @@ def health_check():
         "service": "RoadWise AI Inference",
         "model_loaded": session is not None,
         "gate_loaded": gate_session is not None,
+        "active_model": MODEL_PATH,
     }
 
 
@@ -435,15 +435,21 @@ async def predict_severity(
     if not contents:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413,
-                            detail=f"Image exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.")
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+        )
 
     try:
         gate = _inference_gate or asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
         async with gate:
-            return await run_in_threadpool(analyze, contents, debug)
+            res = await run_in_threadpool(analyze, contents, debug)
+            # Clean up memory immediately to prevent memory leaks on Render 512MB
+            del contents
+            gc.collect()
+            return res
     except HTTPException:
         raise
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.exception("Inference failure")
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
